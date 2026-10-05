@@ -456,7 +456,9 @@ export class ManagedInstanceRegistry {
         continue;
       }
 
-      if (parsed.bootId !== options.currentBootId) {
+      if (parsed.bootId !== options.currentBootId &&
+          options.currentBootId && !options.currentBootId.endsWith(':unknown-boot') &&
+          parsed.bootId && !parsed.bootId.endsWith(':unknown-boot')) {
         await this.cleanupRecord(options, parsed);
         parsed.state = parsed.state === 'failed' ? 'failed' : 'exited';
         parsed.exitedAt = now;
