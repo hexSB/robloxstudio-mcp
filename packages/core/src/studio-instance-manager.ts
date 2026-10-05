@@ -685,7 +685,8 @@ public sealed class McpSuspendedStudio : IDisposable
 
     private static IntPtr OpenTestWorkerJob(string name)
     {
-        if (name == null) return IntPtr.Zero;
+        // PowerShell binds an omitted string argument ($null) as an empty string.
+        if (String.IsNullOrEmpty(name)) return IntPtr.Zero;
         if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"\\ALocal\\\\RsmcpStudioWorker-[a-f0-9]{32}\\z"))
             throw new ArgumentException("Invalid Studio test worker job name");
         IntPtr handle = OpenJobObjectW(5, false, name);
@@ -1525,6 +1526,7 @@ export class StudioInstanceManager {
   private cachedSnapshot?: StudioProcessSnapshot;
   private snapshotInFlight?: Promise<StudioProcessSnapshot>;
   private launchQueue: Promise<void> = Promise.resolve();
+  private knownBootId?: string;
 
   constructor(options: StudioInstanceManagerOptions = {}) {
     this.registry = options.registry ?? new ManagedInstanceRegistry(options.registryDir);
@@ -1774,19 +1776,26 @@ export class StudioInstanceManager {
     return record;
   }
 
-  async launch(options: StudioLaunchOptions): Promise<ManagedStudioInstance> {
+  async launch(options: StudioLaunchOptions, signal?: AbortSignal): Promise<ManagedStudioInstance> {
+    signal?.throwIfAborted();
     const previous = this.launchQueue;
     let release!: () => void;
     this.launchQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
-      return await this.launchSerialized(options);
+      signal?.throwIfAborted();
+      const record = await this.launchSerialized(options, signal);
+      if (signal?.aborted) {
+        await this.close(record);
+        signal.throwIfAborted();
+      }
+      return record;
     } finally {
       release();
     }
   }
 
-  private async launchSerialized(options: StudioLaunchOptions): Promise<ManagedStudioInstance> {
+  private async launchSerialized(options: StudioLaunchOptions, signal?: AbortSignal): Promise<ManagedStudioInstance> {
     const initialSnapshot = await this.getProcessSnapshot(true);
     await this.sweepRegistry(initialSnapshot);
     const processEnvironment = parseStudioProcessEnvironmentPatch(options.processEnvironment);
@@ -1818,6 +1827,7 @@ export class StudioInstanceManager {
     };
     let proc: StudioChildProcess;
     try {
+      signal?.throwIfAborted();
       if (this.processAdapter.spawnStudio) {
         proc = await this.processAdapter.spawnStudio(exe, args, spawnOptions);
       } else if (
@@ -2357,9 +2367,17 @@ export class StudioInstanceManager {
   }
 
   private async getCurrentBootId(): Promise<string> {
-    return this.processAdapter.currentBootId
+    // A running broker cannot survive a host reboot. Avoid repeated slow probes,
+    // and never mistake a failed probe for evidence that owned processes exited.
+    if (this.knownBootId) return this.knownBootId;
+    const bootId = this.processAdapter.currentBootId
       ? await this.processAdapter.currentBootId()
-      : currentBootIdAsync();
+      : await currentBootIdAsync();
+    if (!bootId || bootId.endsWith(':unknown-boot')) {
+      throw new Error('Host boot identity unavailable; retained process lifecycle is unchanged.');
+    }
+    this.knownBootId = bootId;
+    return bootId;
   }
 
   private async registrySweepOptions(

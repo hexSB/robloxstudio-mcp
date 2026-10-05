@@ -223,7 +223,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   get_device_simulator_state: (tools, body) => tools.getDeviceSimulatorState(body.target, body.deviceId, body.includeDeviceList, body.instance_id),
   set_device_simulator: (tools, body) => tools.setDeviceSimulator(body.target, body.deviceId, body.orientation, body.resolution, body.pixelDensity, body.scalingMode, body.stopSimulation, body.instance_id),
   capture_device_matrix: (tools, body) => tools.captureDeviceMatrix(body.entries, body.target, body.format, body.quality, body.settleSeconds, body.restoreAfter, body.instance_id),
-  manage_instance: (tools, body) => tools.manageInstance(body),
+  manage_instance: (tools, body, context) => tools.manageInstance(body, context?.signal),
   solo_playtest: (tools, body) => tools.soloPlaytest(body.action, body.mode, body.timeout, body.instance_id),
   multiplayer_playtest: (tools, body) => tools.multiplayerPlaytest(body.action, body.numPlayers, body.target, body.testArgs, body.value, body.timeout, body.instance_id),
   get_runtime_logs: (tools, body, context) => tools.getRuntimeLogs(body.instance_id, body.multiplayer_group_id, body.cursor, body.cursor_by_instance, body.tail, body.filter, context?.signal),
@@ -955,8 +955,12 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
     if (allowedTools && !allowedTools.has(toolName)) continue;
 
     app.post(`/mcp/${toolName}`, async (req, res) => {
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      req.once('aborted', abort);
+      res.once('close', abort);
       try {
-        const result = normalizeToolResult(await handler(tools, req.body), 'modern');
+        const result = normalizeToolResult(await handler(tools, req.body, { signal: controller.signal }), 'modern');
         if (result.structuredContent && result.content.length === 0) {
           res.json(result.structuredContent);
         } else {
@@ -966,7 +970,10 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
         const status = error instanceof StudioLaunchPreDispatchError
           ? error.statusCode
           : error instanceof RoutingFailure ? 400 : 500;
-        res.status(status).json(publicToolErrorBody(toolName, error));
+        if (!res.destroyed && !res.headersSent) res.status(status).json(publicToolErrorBody(toolName, error));
+      } finally {
+        req.removeListener('aborted', abort);
+        res.removeListener('close', abort);
       }
     });
   }

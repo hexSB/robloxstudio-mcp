@@ -3125,7 +3125,7 @@ export class RobloxStudioTools {
     return match ? Number(match[1]) : undefined;
   }
 
-  async manageInstance(request: Record<string, unknown>) {
+  async manageInstance(request: Record<string, unknown>, signal?: AbortSignal) {
     const action = request.action;
     const instance_id = typeof request.instance_id === 'string' ? request.instance_id : undefined;
     const launch_id = typeof request.launch_id === 'string' ? request.launch_id : undefined;
@@ -3364,7 +3364,7 @@ export class RobloxStudioTools {
       processEnvironment,
       studioWorkingDirectory,
       ...(requireProcessIdentity ? { requireProcessIdentity: true } : {}),
-    });
+    }, signal);
 
     if (!waitForConnection) {
       return this._textResult({
