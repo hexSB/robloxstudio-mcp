@@ -38,6 +38,10 @@ screenshots, memory reports, and profiler captures from each peer.
 - Check an asset's hierarchy, media metadata, and security scan with `preview_asset` before adding it to the place.
 - Add an asset with `insert_asset`. The tool removes scripts and package links, verifies the cleaned result, and then parents it in Studio.
 
+### Manage monetization
+
+- List, create, and update developer products and game passes with `manage_monetization`. New items stay off sale unless you ask, and a name that already exists is refused because Roblox cannot delete these items. Requires an Open Cloud API key; see [Configuration](docs/configuration.md#environment-variables).
+
 ### Look up Roblox APIs
 
 - Fetch official engine API documentation as Markdown with `get_roblox_docs`.
@@ -114,6 +118,18 @@ Both editions prefer the bundled plugin. If it is missing, installation download
 the GitHub release matching the installed npm package version and validates the
 plugin's version and edition before replacing the installed file. This also
 applies to development versions; a missing matching release is an error.
+
+</details>
+
+<details>
+<summary>Native Linux (Wine)</summary>
+
+On native Linux, Studio runs under Wine. To let the server launch and close it,
+set `ROBLOX_STUDIO_WINE_LAUNCHER` to an executable script and `ROBLOX_STUDIO_EXE`
+to `RobloxStudioBeta.exe` inside your Wine prefix. The server runs
+`<launcher> <RobloxStudioBeta.exe path> <Studio arguments...>`; the launcher sets
+up the prefix and display, then must `exec wine "$@"` so Studio keeps its PID.
+See [Native Linux with Wine](docs/configuration.md#native-linux-with-wine).
 
 </details>
 

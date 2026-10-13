@@ -7,6 +7,7 @@ import { cleanupEditBridgeArtifacts, ensureRuntimeBridgeInstalled } from "../mod
 import RuntimeLogBuffer from "../modules/RuntimeLogBuffer";
 import StopPlayMonitor from "../modules/StopPlayMonitor";
 import StudioWebSocket from "../modules/StudioWebSocket";
+import PluginSession from "../modules/PluginSession";
 import BreakpointHandlers from "../modules/handlers/BreakpointHandlers";
 import * as RenderMonitor from "../modules/RenderMonitor";
 
@@ -26,6 +27,10 @@ RuntimeLogBuffer.install();
 StopPlayMonitor.init(plugin);
 BreakpointHandlers.init(plugin);
 ServerUrlSettings.init(plugin);
+// Before anything reads place keys: an edit session removes MCP attributes
+// that older plugin versions saved into the place, and hands its topology to
+// playtest DataModels through plugin settings instead.
+PluginSession.init(plugin, { getServerUrl: () => State.getActiveConnection().serverUrl });
 
 const startupRole = ClientBroker.forkRole();
 
@@ -48,8 +53,8 @@ applyRememberedServerUrl();
 // down their VM. Close the persistent WebStreamClient while BindToClose still
 // gives this server peer a live execution context; otherwise each play cycle
 // can retain one native WebSocket until Studio itself is restarted. The
-// transport releases that native socket before yielding to unregister the
-// logical server peer.
+// transport unregisters the server peer on that socket and waits at most two
+// seconds for the server to close it, so no HTTP request can hold up shutdown.
 if (startupRole === "server") {
 	game.BindToClose(StudioWebSocket.suspendForShutdown);
 }
@@ -97,8 +102,17 @@ plugin.Unloading.Connect(() => {
 
 
 UI.updateUIState();
-Communication.checkForUpdates();
+// Every DataModel shares Studio's five plugin HTTP request slots, and a
+// request has no time limit. Check for updates once, from the edit DataModel,
+// instead of again in every play server and client.
+if (startupRole === "edit") Communication.checkForUpdates();
 task.delay(TOOLBAR_REGISTRATION_DELAY_SECONDS, registerToolbarButton);
+
+/** Runs one startup step so that its failure cannot skip the steps after it. */
+function runStartupStep(description: string, step: () => void): void {
+	const [ok, err] = pcall(step);
+	if (!ok) warn(`[robloxstudio-mcp] ${description} failed: ${err}`);
+}
 
 // Auto-activate per Peer. Runtime plugin VMs can load before their first
 // Heartbeat; task.delay() would then wait behind the very multiplayer startup
@@ -114,12 +128,20 @@ function autoActivatePeer(): void {
 			warn(`[robloxstudio-mcp] Runtime eval bridge install failed: ${result.error}`);
 		}
 	}
+	if (role === "server") {
+		// Yields until this playtest server knows which edit session (or
+		// multiplayer group) it belongs to, so it registers under that identity.
+		// On failure the server still registers, under its own identity.
+		runStartupStep("Playtest topology resolution", () => PluginSession.resolveRuntimeTopology());
+	}
 	if (role === "edit" || role === "server") {
-		const [activationOk, activationError] = pcall(() => {
+		runStartupStep(`Automatic ${role} Peer activation`, () => {
 			const conn = State.getActiveConnection();
 			if (!conn.isActive) {
 				if (role === "server") {
-					const inheritedServerUrl = ServerUrlSettings.readServerUrl() ?? ClientBroker.DEFAULT_MCP_URL;
+					const inheritedServerUrl = PluginSession.getInheritedServerUrl()
+						?? ServerUrlSettings.readServerUrl()
+						?? ClientBroker.DEFAULT_MCP_URL;
 					conn.serverUrl = ServerUrlSettings.normalizeServerUrl(inheritedServerUrl);
 					elements.urlInput.Text = conn.serverUrl;
 					const port = ServerUrlSettings.extractPort(conn.serverUrl);
@@ -135,19 +157,16 @@ function autoActivatePeer(): void {
 				Communication.activatePlugin();
 			}
 		});
-		if (!activationOk) {
-			warn(`[robloxstudio-mcp] Automatic ${role} Peer activation failed: ${activationError}`);
-		}
 	}
 	if (role === "server") {
-		ClientBroker.setupServerBroker();
+		runStartupStep("Client broker setup", () => ClientBroker.setupServerBroker());
 		// The play-server DM is the only one where StudioTestService:EndTest is
 		// legal, so the stop-play monitor lives here. It consumes tokenized
 		// stop requests from plugin settings and acknowledges EndTest results.
-		StopPlayMonitor.startMonitor({
+		runStartupStep("Stop-play monitor startup", () => StopPlayMonitor.startMonitor({
 			beforeEndTest: StudioWebSocket.suspendForShutdown,
 			afterEndTestFailure: StudioWebSocket.resumeAfterShutdownFailure,
-		});
+		}));
 	} else if (role === "client") {
 		ClientBroker.setupClientBroker();
 	}

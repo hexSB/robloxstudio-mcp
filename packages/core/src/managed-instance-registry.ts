@@ -1,4 +1,5 @@
 import * as fs from 'fs/promises';
+import type { Stats } from 'fs';
 import { randomUUID } from 'crypto';
 import * as os from 'os';
 import * as path from 'path';
@@ -260,7 +261,9 @@ export class ManagedInstanceRegistry {
             !activeLockPaths.has(lockDir) &&
             Date.now() - stat.mtimeMs > LOCK_STALE_MS
           )) {
-            await fs.rm(lockDir, { recursive: true, force: true });
+            if (await this.isInspectedLock(lockDir, stat, currentOwner)) {
+              await fs.rm(lockDir, { recursive: true, force: true });
+            }
             continue;
           }
         } catch {
@@ -303,6 +306,20 @@ export class ManagedInstanceRegistry {
     } catch {
       return undefined;
     }
+  }
+
+  // The inspected owner can release, and another holder can take the lock, while this
+  // waiter decides. Reclaim only the instance that was judged abandoned: the same owner
+  // token, or for an unreadable owner the same unchanged directory entry.
+  private async isInspectedLock(
+    lockPath: string,
+    inspected: Stats,
+    inspectedOwner: RegistryLockOwner | undefined,
+  ): Promise<boolean> {
+    const current = await fs.stat(lockPath);
+    const currentOwner = await this.readLockOwner(lockPath, current.isDirectory());
+    if (inspectedOwner) return currentOwner?.token === inspectedOwner.token;
+    return currentOwner === undefined && current.ino === inspected.ino && current.mtimeMs === inspected.mtimeMs;
   }
 
   private async ensureDir() {
@@ -479,6 +496,9 @@ export class ManagedInstanceRegistry {
       if (!options.observeProcess || !(parsed.nativeProcessId || parsed.spawnPid)) continue;
 
       const observation = await options.observeProcess(parsed);
+      const previousObservationAt = parsed.lastProcessObservationAt;
+      // Older evidence (e.g. a snapshot started before this launch) never overrides newer.
+      if (previousObservationAt !== undefined && observation.observedAt < previousObservationAt) continue;
       if (observation.status === 'unknown') {
         parsed.processObservationStatus = 'unknown';
         parsed.lastProcessObservationAt = observation.observedAt;
@@ -489,7 +509,6 @@ export class ManagedInstanceRegistry {
         continue;
       }
 
-      const previousObservationAt = parsed.lastProcessObservationAt;
       parsed.lastSuccessfulProcessObservationAt = observation.observedAt;
       parsed.lastProcessObservationAt = observation.observedAt;
       parsed.lastProcessObservationError = undefined;

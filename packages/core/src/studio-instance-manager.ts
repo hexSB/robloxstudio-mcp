@@ -18,6 +18,13 @@ import {
   type StudioPlatformCapabilities,
   type StudioProcessIdentityLauncher,
 } from './studio-platform.js';
+import {
+  killOrphanedWineLaunchGate,
+  listWineStudioProcesses,
+  spawnWineStudio,
+  stopWineStudio,
+  toWineWindowsPath,
+} from './studio-wine.js';
 
 export type StudioLaunchSource = 'baseplate' | 'local_file' | 'published_place' | 'place_revision';
 
@@ -277,6 +284,10 @@ export function isWsl(): boolean {
   return getStudioPlatformCapabilities().isWsl;
 }
 
+function isWineHost(): boolean {
+  return getStudioPlatformCapabilities().processIdentity.launcher === 'wine-retained';
+}
+
 function powershell(script: string): string {
   return run('powershell.exe', ['-NoProfile', '-Command', script], {
     cwd: isWsl() && existsSync('/mnt/c/Windows') ? '/mnt/c/Windows' : process.cwd(),
@@ -325,11 +336,13 @@ async function toWslPathAsync(windowsPath: string): Promise<string> {
 }
 
 function toStudioLaunchArg(arg: string): string {
+  if (isWineHost() && path.isAbsolute(arg) && existsSync(arg)) return toWineWindowsPath(arg);
   if (!isWsl() || !path.isAbsolute(arg) || !existsSync(arg)) return arg;
   return run('wslpath', ['-w', arg]);
 }
 
 async function toStudioLaunchArgAsync(arg: string): Promise<string> {
+  if (isWineHost() && path.isAbsolute(arg) && existsSync(arg)) return toWineWindowsPath(arg);
   if (!isWsl() || !path.isAbsolute(arg) || !existsSync(arg)) return arg;
   return runAsync('wslpath', ['-w', arg]);
 }
@@ -685,7 +698,7 @@ public sealed class McpSuspendedStudio : IDisposable
 
     private static IntPtr OpenTestWorkerJob(string name)
     {
-        // PowerShell binds an omitted string argument ($null) as an empty string.
+        // PowerShell passes $null to a .NET string parameter as "", so both mean "no worker job".
         if (String.IsNullOrEmpty(name)) return IntPtr.Zero;
         if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"\\ALocal\\\\RsmcpStudioWorker-[a-f0-9]{32}\\z"))
             throw new ArgumentException("Invalid Studio test worker job name");
@@ -1291,7 +1304,21 @@ function resolveStudioExeFromVersions(root: string): string {
   return exe;
 }
 
+// Native Linux runs the Windows Studio build inside a Wine prefix, whose
+// location only the user knows.
+function resolveNativeLinuxStudioExe(): string {
+  const exe = process.env.ROBLOX_STUDIO_EXE;
+  if (!exe) {
+    throw new Error('Set ROBLOX_STUDIO_EXE to RobloxStudioBeta.exe inside your Wine prefix to launch Studio on native Linux.');
+  }
+  if (!statSync(exe, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`ROBLOX_STUDIO_EXE does not name an existing file: ${exe}`);
+  }
+  return exe;
+}
+
 export function resolveStudioExe(): string {
+  if (process.platform === 'linux' && isWineHost()) return resolveNativeLinuxStudioExe();
   if (process.env.ROBLOX_STUDIO_EXE) return process.env.ROBLOX_STUDIO_EXE;
 
   if (process.platform === 'darwin') {
@@ -1311,6 +1338,7 @@ export function resolveStudioExe(): string {
 }
 
 async function resolveStudioExeAsync(): Promise<string> {
+  if (process.platform === 'linux' && isWineHost()) return resolveNativeLinuxStudioExe();
   if (process.env.ROBLOX_STUDIO_EXE) return process.env.ROBLOX_STUDIO_EXE;
   if (process.platform === 'darwin') {
     return '/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio';
@@ -1335,21 +1363,26 @@ const WINDOWS_STUDIO_PROCESS_QUERY = [
   'ConvertTo-Json -InputObject $processes -Compress',
 ].join('; ');
 
+// Windows reports Path = $null for a process whose main module is unreadable,
+// including every launch held suspended until authorization. Exact identity is
+// the PID plus creation time, so a missing path must not fail the snapshot.
+type WindowsStudioProcessEntry = Omit<StudioProcessInfo, 'Path'> & { Path: string | null };
+
 function parseWindowsStudioProcesses(output: string): StudioProcessInfo[] {
   const parsed: unknown = JSON.parse(output);
   const processes: unknown[] = Array.isArray(parsed) ? parsed : [parsed];
-  if (!processes.every((value): value is StudioProcessInfo =>
+  if (!processes.every((value): value is WindowsStudioProcessEntry =>
     value !== null && typeof value === 'object' &&
     'Id' in value && typeof value.Id === 'number' && Number.isSafeInteger(value.Id) && value.Id > 0 &&
     'Name' in value && typeof value.Name === 'string' &&
-    'Path' in value && typeof value.Path === 'string' &&
+    'Path' in value && (typeof value.Path === 'string' || value.Path === null) &&
     'MainWindowTitle' in value && typeof value.MainWindowTitle === 'string' &&
     'StartTimeUtcFileTime' in value && typeof value.StartTimeUtcFileTime === 'string' &&
     /^[1-9]\d*$/u.test(value.StartTimeUtcFileTime)
   )) {
     throw new Error('Malformed Roblox Studio process enumeration result.');
   }
-  return processes;
+  return processes.map(({ Path, ...processInfo }) => (Path === null ? processInfo : { ...processInfo, Path }));
 }
 
 export function listStudioProcesses(): StudioProcessInfo[] {
@@ -1369,6 +1402,14 @@ export function listStudioProcesses(): StudioProcessInfo[] {
         return { Id: Number(pid), Name: 'RobloxStudio', Path: rest.join(' '), MainWindowTitle: '' };
       })
       .filter((proc) => Number.isFinite(proc.Id));
+  }
+
+  if (process.platform === 'linux' && isWineHost()) {
+    try {
+      return listWineStudioProcesses();
+    } catch (error) {
+      throw new Error(`Could not enumerate Roblox Studio processes: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   if (process.platform !== 'win32' && !isWsl()) return [];
@@ -1401,6 +1442,10 @@ export async function observeStudioProcesses(timeoutMs = 15000): Promise<StudioP
         })
         .filter((proc) => Number.isFinite(proc.Id));
       return { status: 'ok', observedAt, processes };
+    }
+
+    if (process.platform === 'linux' && isWineHost()) {
+      return { status: 'ok', observedAt, processes: listWineStudioProcesses() };
     }
 
     if (process.platform !== 'win32' && !isWsl()) {
@@ -1840,6 +1885,12 @@ export class StudioInstanceManager {
           processEnvironment,
           studioWorkingDirectory,
         );
+      } else if (lifecycleCapabilities.processIdentity.launcher === 'wine-retained') {
+        const wineLauncher = (this.platformCapabilities ?? getStudioPlatformCapabilities()).wineLauncher;
+        if (!wineLauncher) throw new Error('The Wine Studio launcher path is unavailable.');
+        proc = await spawnWineStudio(wineLauncher, exe, args, spawnOptions, {
+          logDir: path.join(this.registry.dir, 'wine-launches'),
+        });
       } else {
         const child = spawn(exe, args, spawnOptions);
         proc = {
@@ -2235,6 +2286,11 @@ export class StudioInstanceManager {
           throw new Error('Cannot stop a Windows Studio process without its creation-time identity.');
         }
         await stopWindowsStudio(processId, startedAt, Math.max(1, deadline - Date.now()));
+      } else if (isWineHost()) {
+        if (startedAt === undefined) {
+          throw new Error('Cannot stop a Wine Studio process without its creation-time identity.');
+        }
+        await stopWineStudio(processId, startedAt, Math.max(1, deadline - Date.now()));
       } else {
         try {
           process.kill(processId, 'SIGTERM');
@@ -2400,21 +2456,53 @@ export class StudioInstanceManager {
     };
   }
 
-  private async sweepRegistry(snapshot: StudioProcessSnapshot): Promise<void> {
-    const sweepOptions = await this.registrySweepOptions(snapshot);
-    await this.registry.sweep(sweepOptions);
-    const persisted = await this.registry.listOpenUnchecked();
-    for (const registryRecord of persisted) {
-      const ownerPid = registryRecord.ownerPid;
+  private isOrphanedUnreleasedLaunch(
+    registryRecord: ManagedInstanceRegistryRecord,
+    currentBootId: string,
+  ): boolean {
+    const ownerPid = registryRecord.ownerPid;
+    return !(
+      registryRecord.processAuthorizationState === "released" ||
+      this.launchControls.has(registryRecord.recordId) ||
+      registryRecord.bootId !== currentBootId ||
+      ownerPid === undefined ||
+      (ownerPid !== process.pid && isProcessAlive(ownerPid))
+    );
+  }
+
+  // A broker that dies between spawn and authorization leaves its Wine launch
+  // gate stopped. The gate is /bin/sh, not Studio, so the orphan cleanup below
+  // never sees it in a Studio snapshot.
+  private async reapOrphanedWineLaunchGates(currentBootId: string): Promise<void> {
+    if (this.getLifecycleCapabilities().processIdentity.launcher !== 'wine-retained') return;
+    for (const registryRecord of await this.registry.listOpenUnchecked()) {
+      const processId = registryRecord.nativeProcessId;
+      const startedAt = registryRecord.nativeProcessStartedAt;
       if (
-        registryRecord.processAuthorizationState === "released" ||
-        this.launchControls.has(registryRecord.recordId) ||
-        registryRecord.bootId !== sweepOptions.currentBootId ||
-        ownerPid === undefined ||
-        (ownerPid !== process.pid && isProcessAlive(ownerPid))
+        registryRecord.processAuthorizationState !== 'pending' ||
+        !processId ||
+        !startedAt ||
+        !this.isOrphanedUnreleasedLaunch(registryRecord, currentBootId)
       ) {
         continue;
       }
+      try {
+        if (killOrphanedWineLaunchGate(processId, startedAt)) {
+          console.error(`[studio] Killed Wine launch gate ${processId}, left stopped by a broker that exited before authorizing it.`);
+        }
+      } catch (error) {
+        console.error(`[studio] Could not check orphaned Wine launch gate ${processId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  private async sweepRegistry(snapshot: StudioProcessSnapshot): Promise<void> {
+    const sweepOptions = await this.registrySweepOptions(snapshot);
+    await this.reapOrphanedWineLaunchGates(sweepOptions.currentBootId);
+    await this.registry.sweep(sweepOptions);
+    const persisted = await this.registry.listOpenUnchecked();
+    for (const registryRecord of persisted) {
+      if (!this.isOrphanedUnreleasedLaunch(registryRecord, sweepOptions.currentBootId)) continue;
       const record = this.fromRegistryRecord(registryRecord);
       if (this.observeRecord(record, snapshot).status !== "running") continue;
       const processId = record.nativeProcessId ?? record.spawnPid;
@@ -2648,6 +2736,9 @@ export class StudioInstanceManager {
   ): Promise<void> {
     if (record.closedAt !== undefined) return;
     const previousObservationAt = record.lastProcessObservationAt;
+    // A snapshot can finish after newer evidence was recorded, e.g. one started
+    // before this launch existed. Older evidence never overrides newer.
+    if (previousObservationAt !== undefined && observation.observedAt < previousObservationAt) return;
     record.lastProcessObservationAt = observation.observedAt;
 
     if (observation.status === 'unknown') {
