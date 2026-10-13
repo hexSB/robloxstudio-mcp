@@ -42,6 +42,17 @@ creation/upgrade each have a 20-second deadline. A stalled phase is abandoned
 and retried; late completions cannot replace the current connection. An open
 socket with no valid incoming events for 20 seconds is also reconnected.
 
+The server pings each Studio socket every 10 seconds and closes one that has
+not answered for 30 seconds. A closed socket's peer is unregistered about 30
+seconds after its last answer, even when the plugin never unregistered it.
+
+When a playtest stops, the play server unregisters over its own WebSocket. The
+server closes that socket at once; the plugin waits at most 2 seconds for that
+before closing it itself. It does not use HTTP `/disconnect` here: Studio
+runs at most five plugin HTTP requests at a time across the whole process, with
+no time limit, so a request queued behind five that never finish would hold the
+play server's shutdown until Studio's 30-second deadline.
+
 A previously healthy registration may be revalidated once by reconnecting its
 socket without HTTP, so transient drops can recover even when Studio's HTTP
 quota is exhausted. If that socket cannot open, including a timeout or an
@@ -139,6 +150,63 @@ For the Windows selector regression, run `npm run build -w packages/core` then
 It exercises the shipped selector with synthetic window entries, without
 enumerating or capturing any real windows.
 
+## Native Linux with Wine
+
+On native Linux (not WSL) the server can launch and manage the Windows Studio
+build running under Wine. Set:
+
+- `ROBLOX_STUDIO_WINE_LAUNCHER` to an executable launcher script. Without it,
+  `/health` reports `processIdentity.supported: false` on native Linux.
+- `ROBLOX_STUDIO_EXE` to `RobloxStudioBeta.exe` inside the Wine prefix, unless
+  every launch passes `studio_executable`. The file must exist.
+
+The server runs the launcher as
+`<launcher> <unix path to RobloxStudioBeta.exe> <Studio arguments...>`. The
+launcher prepares the Wine environment (`WINEPREFIX`, display, and so on) and
+must `exec` Wine on the executable as its last step, so Studio keeps the
+launcher's PID:
+
+```sh
+#!/bin/sh
+export WINEPREFIX="${WINEPREFIX:-$HOME/.wine}"
+exe="$1"; shift
+exec wine "$exe" "$@"
+```
+
+Wrappers that start Studio in a new process, such as `proton run`, do not keep
+the PID and are rejected. The same applies to launchers that run Wine inside a
+sandbox with its own PID namespace, such as Flatpak, bubblewrap, or the Steam
+runtime (pressure-vessel): the server must see Studio's PID in its own `/proc`.
+
+The launch is held stopped until it is authorized; after that the gated process
+must become `RobloxStudioBeta.exe` within 60 seconds or it is killed. A cold
+start can be slower (the first launch starts `wineserver` and may update the
+prefix, and x86 emulation adds more), so raise
+`ROBLOX_STUDIO_WINE_START_TIMEOUT_MS` if launches time out. If the broker exits
+while a launch is still held, the next broker that uses the same registry kills
+the held process; nothing Windows-side ran in it.
+
+Absolute paths among the Studio arguments are passed as `Z:\...` paths, so the
+prefix must keep Wine's default `Z:` drive mapped to `/`. A launch's
+`process_environment` is applied to the launcher, so a caller can pick the
+prefix with `WINEPREFIX`.
+
+The launcher's stdout and stderr go to a per-launch log in `wine-launches/`
+inside the managed-instance registry directory
+(`~/.local/state/robloxstudio-mcp/managed-instances/v1/` unless
+`ROBLOXSTUDIO_MCP_MANAGED_INSTANCE_REGISTRY_DIR` is set). The newest 10 logs are
+kept, and a failed launch includes the end of its log in the error. Wine keeps
+writing to the log while Studio runs; set `WINEDEBUG=-all` in the launcher to
+keep it small.
+
+Studio processes are identified by `/proc` PID and start time, and only the
+current user's processes are listed. The start time is converted to a UTC time
+using a boot-time reference saved for each boot in the registry directory, so
+identities still match after a broker restart even if the system clock was
+stepped. `close` sends SIGTERM to that exact process, then SIGKILL if it is still
+running. Sign-in settling before close and host window capture are not available
+under Wine.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -149,10 +217,19 @@ enumerating or capturing any real windows.
 | `ROBLOX_STUDIO_NO_AUTH` | Unset | Set to `1` or `true` to disable HTTP tool authentication. This is not recommended. |
 | `ROBLOX_STUDIO_ALLOWED_ORIGINS` | None | Comma-separated browser origins allowed to call the HTTP API cross-origin. |
 | `ROBLOX_STUDIO_HOST_CAPTURE` | Unset | Set to `0`, `false`, or `off` to disable the host window capture fallback for `capture_screenshot`. |
-| `ROBLOX_OPEN_CLOUD_API_KEY` | None | Roblox Open Cloud key used by features such as audio preview and place version access. Required permissions depend on the tool. |
+| `ROBLOX_OPEN_CLOUD_API_KEY` | None | Roblox Open Cloud key used by features such as audio preview, place version access, and monetization. Required permissions depend on the tool. |
 | `MCP_PLUGINS_DIR` | Platform Studio Plugins folder | Override the destination used by plugin installation. |
+| `ROBLOX_STUDIO_EXE` | Auto-discovered on Windows, WSL, and macOS | Studio executable to launch. Required on native Linux with a Wine launcher, where it must be an existing `RobloxStudioBeta.exe` in the Wine prefix. |
+| `ROBLOX_STUDIO_WINE_LAUNCHER` | Unset | Native Linux only: executable that `exec`s Wine on Studio. See [Native Linux with Wine](#native-linux-with-wine). |
+| `ROBLOX_STUDIO_WINE_START_TIMEOUT_MS` | `60000` | Native Linux with Wine only: how long an authorized launch may take to become `RobloxStudioBeta.exe`, from 1 to 150000 ms. |
 
 Creator Store audio preview requires the `legacy-asset:manage` scope (Legacy
 Assets → manage in the API key settings); `asset:read` alone returns 403. See
 [Creator Store assets](creator-store-assets.md) for its download and validation
 behavior.
+
+`manage_monetization` needs `developer-product:read` and `developer-product:write`
+for developer products, or `game-pass:read` and `game-pass:write` for game passes,
+with the experience added to the key. Listing and reading need only the read
+scope. Create and update need both: create first checks for an existing name,
+and update reads the item back.
